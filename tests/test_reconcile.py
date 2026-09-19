@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.reconcile import MASK_PRIORITY, align_three, column_cost, reconcile
+from app.reconcile import MASK_PRIORITY, align_three, column_cost, reconcile, reconcile_anchored
 
 client = TestClient(app)
 
@@ -226,6 +226,234 @@ def test_api_response_shape():
 
 def test_health():
     assert client.get("/health").json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------- 锚点对齐
+
+def _slow_align_anchored(a, b, c, anchors):
+    """按锚点切段、逐段调用参考实现,用于交叉验证锚点对齐。"""
+    seqs = (a, b, c)
+    total = 0
+    cols = []
+    offset = [0, 0, 0]
+
+    def push(col, off, anchored):
+        m, g, p = col
+        p = [v + off[s] if v is not None else None for s, v in enumerate(p)]
+        nonlocal total
+        total += _slow_col_cost(g)
+        cols.append((m, g, p, anchored))
+
+    for pa, pb, pc in anchors:
+        ends = [pa, pb, pc]
+        seg = [seqs[s][offset[s] : ends[s]] for s in range(3)]
+        _, seg_cols = _slow_align(*seg)
+        for col in seg_cols:
+            push(col, offset, False)
+        g = [seqs[s][ends[s]] for s in range(3)]
+        push((7, g, [pa, pb, pc]), [0, 0, 0], True)
+        offset = [v + 1 for v in ends]
+
+    seg = [seqs[s][offset[s] :] for s in range(3)]
+    _, tail_cols = _slow_align(*seg)
+    for col in tail_cols:
+        push(col, offset, False)
+    return total, cols
+
+
+def _slow_col_cost(g):
+    cost = 0
+    for x, y in ((0, 1), (0, 2), (1, 2)):
+        gx, gy = g[x], g[y]
+        if gx is None and gy is None:
+            continue
+        if gx is None or gy is None or gx != gy:
+            cost += 1
+    return cost
+
+
+def test_anchored_forces_same_column():
+    # 无锚点时最优为两列 mask 7:[甲甲甲]0 + [甲乙乙]2,成本 2。
+    # 锚点 (0,1,1) 强制 A 的首 "甲" 与 B、C 的 "乙" 同列:
+    # [·甲甲](mask6,2) -> [甲乙乙](锚点列,2) -> [甲··](mask1,2),成本升至 6。
+    result = reconcile_anchored(
+        list("甲甲"), list("甲乙"), list("甲乙"), [(0, 1, 1)]
+    )
+    assert [c["mask"] for c in result["columns"]] == [6, 7, 1]
+    anchor_col = result["columns"][1]
+    assert anchor_col["anchored"] is True
+    assert anchor_col["sources"][0] == {"grapheme": "甲", "position": 0}
+    assert anchor_col["sources"][1] == {"grapheme": "乙", "position": 1}
+    assert anchor_col["sources"][2] == {"grapheme": "乙", "position": 1}
+    assert all(c["anchored"] is False for c in (result["columns"][0], result["columns"][2]))
+    assert result["total_cost"] == 6
+    # 锚点列 B、C 两份 "乙" 仍达成共识;尾部仅 A 的 "甲" 无法共识
+    assert result["consensus"] == "甲乙�"
+    assert sum(c["cost"] for c in result["columns"]) == result["total_cost"]
+    # 无锚点对照:同样输入成本仅 2
+    assert reconcile(list("甲甲"), list("甲乙"), list("甲乙"))["total_cost"] == 2
+
+
+def test_anchored_positions_remain_absolute_offsets():
+    # 锚点位于来源 0 的中部、来源 1/2 的首部;其前后区间列的 position 必须是绝对位置
+    result = reconcile_anchored(
+        list("X甲Y"), list("甲W"), list("甲R"), [(1, 0, 0)]
+    )
+    anchor_idx = next(i for i, c in enumerate(result["columns"]) if c["anchored"])
+    anchor_col = result["columns"][anchor_idx]
+    assert [s["position"] for s in anchor_col["sources"]] == [1, 0, 0]
+    assert [s["grapheme"] for s in anchor_col["sources"]] == ["甲", "甲", "甲"]
+    # 前导列只消费来源 0 的 X,位置为原序列下标 0
+    head = result["columns"][:anchor_idx]
+    head_pos = [s["position"] for c in head for s in c["sources"] if s["position"] is not None]
+    assert head_pos == [0]
+    # 收尾区间:[Y··](1) + [·W R](6)
+    tail = result["columns"][anchor_idx + 1 :]
+    tail_pos = [
+        (s["position"], s["grapheme"])
+        for c in tail
+        for s in c["sources"]
+        if s["position"] is not None
+    ]
+    assert tail_pos == [(2, "Y"), (1, "W"), (1, "R")]
+
+
+def test_anchored_mismatching_graphemes_count_cost_and_uncertain():
+    # 锚点三字互异:锚点列成本 3、无共识,但仍强制同列
+    result = reconcile_anchored(list("甲"), list("乙"), list("丙"), [(0, 0, 0)])
+    assert len(result["columns"]) == 1
+    col = result["columns"][0]
+    assert col["anchored"] is True and col["mask"] == 7 and col["cost"] == 3
+    assert col["consensus"] == "�"
+    assert result["total_cost"] == 3
+    assert result["uncertain"] == [{"column": 0, "sources": col["sources"]}]
+
+
+def test_anchored_multiple_including_ends():
+    result = reconcile_anchored(
+        list("甲乙"), list("甲乙"), list("甲乙"), [(0, 0, 0), (1, 1, 1)]
+    )
+    assert result["total_cost"] == 0
+    assert [c["anchored"] for c in result["columns"]] == [True, True]
+    assert [c["mask"] for c in result["columns"]] == [7, 7]
+    assert result["consensus"] == "甲乙"
+
+
+def test_anchored_empty_anchor_list_equals_plain():
+    plain = reconcile(list("甲X乙"), list("甲乙"), list("甲乙"))
+    anchored = reconcile_anchored(list("甲X乙"), list("甲乙"), list("甲乙"), [])
+    assert anchored["consensus"] == plain["consensus"]
+    assert anchored["total_cost"] == plain["total_cost"]
+    assert all(c["anchored"] is False for c in anchored["columns"])
+
+
+def test_anchored_fuzz_against_slow_reference():
+    rng = random.Random(99)
+    alphabets = ["甲乙", "甲乙丙", "甲乙丙丁"]
+    for _ in range(60):
+        alpha = rng.choice(alphabets)
+        seqs = [[rng.choice(alpha) for _ in range(rng.randint(1, 5))] for _ in range(3)]
+        # 为每个来源独立抽取一个严格递增的子序列位置作为锚点候选
+        chosen = [sorted(rng.sample(range(len(s)), rng.randint(1, len(s)))) for s in seqs]
+        n = min(len(c) for c in chosen)
+        anchors = list(zip(*[c[:n] for c in chosen]))
+        fast = reconcile_anchored(*seqs, anchors)
+        slow_total, slow_cols = _slow_align_anchored(*seqs, anchors)
+        assert fast["total_cost"] == slow_total, (seqs, anchors)
+        assert len(fast["columns"]) == len(slow_cols)
+        for fc, (m, g, p, flag) in zip(fast["columns"], slow_cols):
+            assert fc["mask"] == m and fc["sources"][0]["position"] == p[0]
+            assert fc["anchored"] is flag
+
+
+# ---------------------------------------------------------------- 锚点 API
+
+def test_api_anchored_happy_path():
+    resp = client.post(
+        "/reconcile/anchored",
+        json={
+            "texts": ["甲甲", "甲乙", "甲乙"],
+            "anchors": [{"positions": [0, 1, 1]}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus"] == "甲乙�"
+    assert body["total_cost"] == 6
+    assert [c["mask"] for c in body["columns"]] == [6, 7, 1]
+    assert [c["anchored"] for c in body["columns"]] == [False, True, False]
+    assert set(body) == {"consensus", "total_cost", "columns", "uncertain"}
+    assert set(body["columns"][0]) == {"index", "mask", "cost", "sources", "consensus", "anchored"}
+
+
+def test_api_plain_reconcile_has_no_anchored_field():
+    resp = client.post("/reconcile", json={"texts": ["甲乙", "甲乙", "甲乙"]})
+    assert resp.status_code == 200
+    assert "anchored" not in resp.json()["columns"][0]
+
+
+def test_api_anchored_defaults_to_empty_list():
+    resp = client.post("/reconcile/anchored", json={"texts": ["甲乙", "甲乙", "甲乙"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_cost"] == 0
+    assert all(c["anchored"] is False for c in body["columns"])
+
+
+def test_api_anchored_rejects_out_of_range():
+    payload = {"texts": ["甲", "甲", "甲"], "anchors": [{"positions": [0, 1, 0]}]}
+    assert client.post("/reconcile/anchored", json=payload).status_code == 422
+    payload = {"texts": ["甲", "甲", "甲"], "anchors": [{"positions": [-1, 0, 0]}]}
+    assert client.post("/reconcile/anchored", json=payload).status_code == 422
+
+
+def test_api_anchored_rejects_non_increasing_per_source():
+    # 来源 0 上 1 -> 0 倒序
+    payload = {
+        "texts": ["甲乙", "甲乙", "甲乙"],
+        "anchors": [{"positions": [1, 0, 0]}, {"positions": [0, 1, 1]}],
+    }
+    assert client.post("/reconcile/anchored", json=payload).status_code == 422
+    # 来源 0 上位置 0 重复
+    payload = {
+        "texts": ["甲乙", "甲乙", "甲乙"],
+        "anchors": [{"positions": [0, 0, 0]}, {"positions": [0, 1, 1]}],
+    }
+    assert client.post("/reconcile/anchored", json=payload).status_code == 422
+    # 其余来源严格递增不能豁免:来源 2 重复
+    payload = {
+        "texts": ["甲乙丙", "甲乙丙", "甲乙丙"],
+        "anchors": [{"positions": [0, 0, 1]}, {"positions": [1, 1, 1]}],
+    }
+    assert client.post("/reconcile/anchored", json=payload).status_code == 422
+
+
+def test_api_anchored_rejects_bad_anchor_shape():
+    base = {"texts": ["甲", "甲", "甲"]}
+    for anchors in (
+        [{"positions": [0, 0]}],
+        [{"positions": [0, 0, 0, 0]}],
+        [{"positions": [0, "x", 0]}],
+        [{"positions": [0, True, 0]}],
+        [{}],
+    ):
+        assert client.post("/reconcile/anchored", json={**base, "anchors": anchors}).status_code == 422
+
+
+def test_api_anchored_grapheme_positions():
+    # emoji 字素簇按簇计位:位置 1 是第二个家庭 emoji,不是码点偏移
+    family = "👨‍👩‍👧‍👦"
+    resp = client.post(
+        "/reconcile/anchored",
+        json={
+            "texts": [family * 2, family * 2, family * 2],
+            "anchors": [{"positions": [1, 1, 1]}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_cost"] == 0
+    assert [c["anchored"] for c in body["columns"]] == [False, True]
 
 
 # ---------------------------------------------------------------- 性能

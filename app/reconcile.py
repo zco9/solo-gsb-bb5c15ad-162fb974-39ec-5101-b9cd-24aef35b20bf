@@ -140,10 +140,16 @@ def column_cost(g: list) -> int:
     return cost
 
 
-def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
-    """对齐三段字素簇序列并生成共识结果。"""
-    total_cost, columns = align_three(a, b, c)
+def _build_result(
+    total_cost: int,
+    columns: list[tuple[int, list, list]],
+    anchored_flags: list[bool] | None = None,
+) -> dict:
+    """由对齐列生成共识结果。
 
+    anchored_flags 给出每列是否为锚点列;为 None 时所有列均不带 anchored 标记
+    (供原有 /reconcile 使用,响应字段保持不变)。
+    """
     out_columns = []
     uncertain = []
     consensus_chars = []
@@ -157,15 +163,16 @@ def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
             cons = REPLACEMENT
             uncertain.append({"column": idx, "sources": sources})
         consensus_chars.append(cons)
-        out_columns.append(
-            {
-                "index": idx,
-                "mask": mask,
-                "cost": cost,
-                "sources": sources,
-                "consensus": cons,
-            }
-        )
+        column = {
+            "index": idx,
+            "mask": mask,
+            "cost": cost,
+            "sources": sources,
+            "consensus": cons,
+        }
+        if anchored_flags is not None:
+            column["anchored"] = anchored_flags[idx]
+        out_columns.append(column)
 
     return {
         "consensus": "".join(consensus_chars),
@@ -173,3 +180,62 @@ def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
         "columns": out_columns,
         "uncertain": uncertain,
     }
+
+
+def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
+    """对齐三段字素簇序列并生成共识结果。"""
+    total_cost, columns = align_three(a, b, c)
+    return _build_result(total_cost, columns)
+
+
+def reconcile_anchored(
+    a: list[str],
+    b: list[str],
+    c: list[str],
+    anchors: list[tuple[int, int, int]],
+) -> dict:
+    """带锚点约束的对齐。
+
+    每个锚点 (pa, pb, pc) 强制三份文本中对应原位置的字素簇出现在同一对齐列
+    (掩码必为 7)。以锚点为界把三段序列切成若干区间,各区间独立做全局最小
+    成本对齐,再与锚点列按序拼接;锚点列同样参与成本与共识计算。
+    调用方需保证 anchors 在三个来源上均严格递增且不越界。
+    """
+    seqs = (a, b, c)
+    columns: list[tuple[int, list, list]] = []
+    anchored_flags: list[bool] = []
+    total_cost = 0
+    starts = [0, 0, 0]
+
+    for anchor in anchors:
+        ends = list(anchor)
+        # 锚点之前的区间:三段各自的 [starts[s], ends[s]) 独立对齐
+        segments = [seqs[s][starts[s] : ends[s]] for s in range(3)]
+        seg_cost, seg_cols = align_three(*segments)
+        offset = starts
+        for m, g, p in seg_cols:
+            p = [v + offset[s] if v is not None else None for s, v in enumerate(p)]
+            columns.append((m, g, p))
+            anchored_flags.append(False)
+        total_cost += seg_cost
+
+        # 锚点列:三份文本各取锚点位置的字素,强制同列
+        g = [seqs[s][ends[s]] for s in range(3)]
+        p = list(anchor)
+        anchor_cost = column_cost(g)
+        total_cost += anchor_cost
+        columns.append((7, g, p))
+        anchored_flags.append(True)
+
+        starts = [v + 1 for v in ends]
+
+    # 最后一个锚点之后的收尾区间
+    segments = [seqs[s][starts[s] :] for s in range(3)]
+    tail_cost, tail_cols = align_three(*segments)
+    for m, g, p in tail_cols:
+        p = [v + starts[s] if v is not None else None for s, v in enumerate(p)]
+        columns.append((m, g, p))
+        anchored_flags.append(False)
+    total_cost += tail_cost
+
+    return _build_result(total_cost, columns, anchored_flags)
