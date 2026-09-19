@@ -17,6 +17,30 @@ class ReconcileRequest(BaseModel):
         return v
 
 
+class Anchor(BaseModel):
+    """一个锚点:三份文本中必须同列对齐的字素簇位置(0 起始)。"""
+
+    positions: list[int] = Field(
+        ..., description="恰好三个位置,依次为 texts[0]/texts[1]/texts[2] 中的字素簇下标"
+    )
+
+    @field_validator("positions")
+    @classmethod
+    def _exactly_three(cls, v: list[int]) -> list[int]:
+        if len(v) != 3:
+            raise ValueError("锚点必须恰好给出三个位置(positions 长度须为 3)")
+        return v
+
+
+class AnchoredReconcileRequest(ReconcileRequest):
+    """三段文本加锚点列表。"""
+
+    anchors: list[Anchor] = Field(
+        default_factory=list,
+        description="锚点列表;各来源位置须严格递增、不越界、不重复,否则返回 422",
+    )
+
+
 class SourceCell(BaseModel):
     """某列中一个来源的字素及其原位置;空位均为 null。"""
 
@@ -42,3 +66,13 @@ class ReconcileResponse(BaseModel):
     total_cost: int = Field(..., description="对齐总成本")
     columns: list[Column] = Field(..., description="对齐列")
     uncertain: list[UncertainColumn] = Field(..., description="写入 � 的列及各来源字素与原位置")
+
+
+class AnchoredColumn(Column):
+    """附带 anchored 标记的对齐列。"""
+
+    anchored: bool = Field(..., description="本列是否为锚点强制对齐列")
+
+
+class AnchoredReconcileResponse(ReconcileResponse):
+    columns: list[AnchoredColumn] = Field(..., description="对齐列(含 anchored 标记)")

@@ -75,12 +75,68 @@ curl -X POST http://localhost:8000/reconcile \
 }
 ```
 
+### `POST /reconcile/anchored`
+
+与 `/reconcile` 相同,但可额外提供**锚点**:每个锚点给出三份文本各自的字素簇位置(0 起始),强制这三个字素出现在同一对齐列。对齐时以锚点切分前后区间,各区间分别求全局最小成本后拼接;锚点列照常参与成本与共识计算。响应每列增加 `anchored` 标记,所有 `position` 仍为原文绝对位置。
+
+锚点需满足:各来源位置**严格递增**、**不越界**、**不重复**,否则返回 422;`anchors` 可省略或为空,此时等价于 `/reconcile`(仅多出 `anchored` 标记)。
+
+```json
+{
+  "texts": ["甲乙", "甲丙", "甲乙"],
+  "anchors": [{"positions": [1, 1, 1]}]
+}
+```
+
+```bash
+curl -X POST http://localhost:8000/reconcile/anchored \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["甲乙", "甲丙", "甲乙"], "anchors": [{"positions": [1, 1, 1]}]}'
+```
+
+响应示例(第二列为锚点强制对齐列):
+
+```json
+{
+  "consensus": "甲乙",
+  "total_cost": 2,
+  "columns": [
+    {
+      "index": 0,
+      "mask": 7,
+      "cost": 0,
+      "sources": [
+        {"grapheme": "甲", "position": 0},
+        {"grapheme": "甲", "position": 0},
+        {"grapheme": "甲", "position": 0}
+      ],
+      "consensus": "甲",
+      "anchored": false
+    },
+    {
+      "index": 1,
+      "mask": 7,
+      "cost": 2,
+      "sources": [
+        {"grapheme": "乙", "position": 1},
+        {"grapheme": "丙", "position": 1},
+        {"grapheme": "乙", "position": 1}
+      ],
+      "consensus": "乙",
+      "anchored": true
+    }
+  ],
+  "uncertain": []
+}
+```
+
 ## 对齐规则
 
 - 每列可消费任意非空来源组合,以位掩码表示:bit0/1/2 分别对应 `texts[0]/texts[1]/texts[2]`(如 `mask=5` 表示该列消费来源 0 与 2)。
 - 单列成本:两两配对中,字符不等或字符与空位配对各计 1,空位与空位计 0;总成本为各列之和,取全局最小。
 - 平局时依次偏好:消费来源数更多的掩码、位掩码更小的掩码(优先级 `7 > 3 > 5 > 6 > 1 > 2 > 4`)。
 - 共识:某列至少两份相同非空字素时写入该字素,否则写入 `�`,并在 `uncertain` 中列出该列各来源的字素与原位置(0 起始,空位为 `null`)。
+- 锚点(仅 `/reconcile/anchored`):每个锚点强制三份文本指定位置的字素同列(掩码 7);锚点把序列切分为若干区间,各区间独立求全局最小成本后拼接,锚点列照常计入成本与共识。
 
 ## 本地开发
 

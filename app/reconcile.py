@@ -140,10 +140,12 @@ def column_cost(g: list) -> int:
     return cost
 
 
-def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
-    """对齐三段字素簇序列并生成共识结果。"""
-    total_cost, columns = align_three(a, b, c)
-
+def _build_result(
+    total_cost: int,
+    columns: list[tuple[int, list, list]],
+    anchored: list[bool] | None = None,
+) -> dict:
+    """由对齐列生成共识结果;提供 anchored 时每列附带 anchored 标记。"""
     out_columns = []
     uncertain = []
     consensus_chars = []
@@ -157,15 +159,16 @@ def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
             cons = REPLACEMENT
             uncertain.append({"column": idx, "sources": sources})
         consensus_chars.append(cons)
-        out_columns.append(
-            {
-                "index": idx,
-                "mask": mask,
-                "cost": cost,
-                "sources": sources,
-                "consensus": cons,
-            }
-        )
+        column = {
+            "index": idx,
+            "mask": mask,
+            "cost": cost,
+            "sources": sources,
+            "consensus": cons,
+        }
+        if anchored is not None:
+            column["anchored"] = anchored[idx]
+        out_columns.append(column)
 
     return {
         "consensus": "".join(consensus_chars),
@@ -173,3 +176,48 @@ def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
         "columns": out_columns,
         "uncertain": uncertain,
     }
+
+
+def reconcile(a: list[str], b: list[str], c: list[str]) -> dict:
+    """对齐三段字素簇序列并生成共识结果。"""
+    total_cost, columns = align_three(a, b, c)
+    return _build_result(total_cost, columns)
+
+
+def reconcile_anchored(
+    a: list[str],
+    b: list[str],
+    c: list[str],
+    anchors: list[tuple[int, int, int]],
+) -> dict:
+    """带锚点的对齐:每个锚点 (i, j, k) 强制 a[i]、b[j]、c[k] 同列。
+
+    锚点须按各来源位置严格递增且不越界(由调用方校验)。以锚点把三段
+    序列切分为若干区间,各区间独立求全局最小成本对齐后拼接;锚点列
+    (掩码 7)照常参与成本与共识计算。每列附带 anchored 标记,所有位置
+    均为原序列绝对下标。
+    """
+    columns: list[tuple[int, list, list]] = []
+    anchored: list[bool] = []
+    total_cost = 0
+    start = (0, 0, 0)
+    for anchor in [*anchors, None]:
+        stop = anchor if anchor is not None else (len(a), len(b), len(c))
+        seg_cost, seg_columns = align_three(
+            a[start[0]:stop[0]], b[start[1]:stop[1]], c[start[2]:stop[2]]
+        )
+        total_cost += seg_cost
+        for mask, g, p in seg_columns:
+            # 区间内的相对位置换算回原序列绝对位置
+            abs_p = [None if p[s] is None else p[s] + start[s] for s in range(3)]
+            columns.append((mask, g, abs_p))
+            anchored.append(False)
+        if anchor is None:
+            continue
+        i, j, k = anchor
+        g = [a[i], b[j], c[k]]
+        columns.append((7, g, [i, j, k]))
+        anchored.append(True)
+        total_cost += column_cost(g)
+        start = (i + 1, j + 1, k + 1)
+    return _build_result(total_cost, columns, anchored)
